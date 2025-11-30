@@ -26,7 +26,8 @@ def compute_var_loss(
         true_var = (X_obs - Y_obs.detach()) ** 2
         M_obs_var = M_obs
         sum_dim = 1
-    elif compute_variance == "covariance":
+    elif compute_variance in ["covariance", "volatility"]:
+        # Note: 'volatility' uses same computation as 'covariance' (both use matrix form)
         d2 = Y_var.shape[1]
         d = int(np.sqrt(d2))
         Y_var_bj_v = Y_var_bj.view(-1, d, d)
@@ -47,8 +48,8 @@ def compute_var_loss(
             M_obs_var = torch.matmul(M_obs_var, M_obs_var.transpose(1, 2))
         sum_dim = (1, 2)
     else:
-        raise ValueError("compute_variance must be either 'variance' or "
-                         "'covariance'")
+        raise ValueError("compute_variance must be either 'variance', "
+                         "'covariance', or 'volatility'")
     # print("compute_variance: ", compute_variance)
     # print("M_obs_var: ", M_obs_var.shape)
     # print("true_var_bj: ", true_var_bj.shape)
@@ -652,6 +653,106 @@ def compute_loss_gen_coeffs(
     return outer / batch_size
 
 
+def compute_loss_noise_robust(
+        X_obs, Y_obs, Y_obs_bj, n_obs_ot, batch_size, eps=1e-10,
+        weight=0.5, M_obs=None,
+        compute_variance=None, var_weight=1.,
+        Y_var_bj=None, Y_var=None, dim_to=None, which_var_loss=None,
+        **kwargs):
+    """
+    Noise-robust loss function for noisy observations.
+
+    This loss function only evaluates predictions at the LEFT LIMIT of observation
+    times (Y_obs_bj), avoiding the "attraction to noisy observations" problem.
+
+    Key difference from standard loss:
+    - Standard loss has two terms: ||X_obs - Y_obs||² + ||Y_obs_bj - Y_obs||²
+      The second term attracts predictions toward observations (even if noisy)
+    - Noise-robust loss: ONLY ||X_obs - Y_obs_bj||²
+      Compares left-limit prediction to observation, no attraction term
+
+    This is theoretically justified when observations are noisy: O_t = X_t + ε
+    The conditional expectation E[X_t | past observations] should not jump at t,
+    so we evaluate the continuous prediction (left-limit) against the observation.
+
+    Reference: Section 4 of the paper on noisy observations with NJ-ODE
+
+    Args:
+        X_obs: Observed values (potentially noisy)
+        Y_obs: Predictions after jump (not used in this loss)
+        Y_obs_bj: Predictions before jump (left-limit, continuous evolution)
+        n_obs_ot: Number of observations per path
+        batch_size: Batch size
+        eps: Small constant for numerical stability
+        weight: Not used in this loss (kept for interface compatibility)
+        M_obs: Mask for partially observed dimensions
+        compute_variance: Whether to compute variance loss
+        var_weight: Weight for variance loss
+        Y_var_bj: Variance predictions before jump
+        Y_var: Variance predictions after jump
+        dim_to: Dimension for variance computation
+        which_var_loss: Type of variance loss (1, 2, or 3)
+
+    Returns:
+        Scalar loss value
+    """
+    if M_obs is None:
+        M_obs = 1.
+
+    # ONLY evaluate left-limit prediction vs observation
+    # No attraction term: predictions should not jump toward noisy observations
+    inner = torch.sum(M_obs * (X_obs - Y_obs_bj) ** 2, dim=1)
+    outer = torch.sum(inner / n_obs_ot)
+
+    # Compute variance loss if requested
+    if compute_variance is not None:
+        # Use type 3 variance loss (only before-jump term)
+        var_loss_type = 3 if which_var_loss is None else which_var_loss
+        outer += compute_var_loss(
+            X_obs, Y_obs, Y_obs_bj, n_obs_ot, batch_size, eps=eps,
+            weight=weight, M_obs=M_obs,
+            compute_variance=compute_variance, var_weight=var_weight,
+            Y_var_bj=Y_var_bj, Y_var=Y_var, dim_to=dim_to, type=var_loss_type)
+
+    return outer / batch_size
+
+
+def compute_loss_noise_robust_mse(
+        X_obs, Y_obs, Y_obs_bj, n_obs_ot, batch_size, eps=1e-10,
+        weight=0.5, M_obs=None,
+        compute_variance=None, var_weight=1.,
+        Y_var_bj=None, Y_var=None, dim_to=None, which_var_loss=None,
+        **kwargs):
+    """
+    Noise-robust loss with simple MSE (no sqrt like in standard loss).
+
+    This is an even simpler version that directly uses MSE without the
+    complicated sqrt structure of the original NJODE loss.
+
+    Args:
+        Same as compute_loss_noise_robust
+
+    Returns:
+        Scalar loss value
+    """
+    if M_obs is None:
+        M_obs = 1.
+
+    # Simple MSE: mean over dimensions, then mean over observations
+    inner = torch.mean(M_obs * (X_obs - Y_obs_bj) ** 2, dim=1)
+    outer = torch.sum(inner / n_obs_ot)
+
+    # Compute variance loss if requested
+    if compute_variance is not None:
+        var_loss_type = 3 if which_var_loss is None else which_var_loss
+        outer += compute_var_loss(
+            X_obs, Y_obs, Y_obs_bj, n_obs_ot, batch_size, eps=eps,
+            weight=weight, M_obs=M_obs,
+            compute_variance=compute_variance, var_weight=var_weight,
+            Y_var_bj=Y_var_bj, Y_var=Y_var, dim_to=dim_to, type=var_loss_type)
+
+    return outer / batch_size
+
 
 
 LOSS_FUN_DICT = {
@@ -669,6 +770,9 @@ LOSS_FUN_DICT = {
     'vola_lim': compute_loss_vola_lim,
     'drift_lim': compute_loss_drift_lim,
     'gen_coeffs': compute_loss_gen_coeffs,
+    'noise_robust': compute_loss_noise_robust,
+    'noise_robust_mse': compute_loss_noise_robust_mse,
+    'legacy': compute_loss_2,  # Legacy loss for comparison with noise-robust
 
     # Quantile loss functions, based on the quantile regression loss.
     #   They are called with the quantiles and return the corresponding
